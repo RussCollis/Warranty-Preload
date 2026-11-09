@@ -52,7 +52,6 @@ final class SettingsStore {
         static let computerFileName = "computerFileName"
         static let mobileFileName = "mobileFileName"
         static let preloadFileName = "preloadFileName"
-        static let incremental = "incremental"
         static let vendors = "vendors"
         static let pemBookmark = "pemBookmark"
         static let outputBookmark = "outputBookmark"
@@ -76,7 +75,6 @@ final class SettingsStore {
     var computerFileName: String { didSet { defaults.set(computerFileName, forKey: Key.computerFileName) } }
     var mobileFileName: String { didSet { defaults.set(mobileFileName, forKey: Key.mobileFileName) } }
     var preloadFileName: String { didSet { defaults.set(preloadFileName, forKey: Key.preloadFileName) } }
-    var incremental: Bool { didSet { defaults.set(incremental, forKey: Key.incremental) } }
     var vendors: [VendorEntry] { didSet { saveVendors() } }
 
     /// Resolved locations (from saved bookmarks).
@@ -93,7 +91,6 @@ final class SettingsStore {
         computerFileName = defaults.string(forKey: Key.computerFileName) ?? "ComputerTemplate.csv"
         mobileFileName = defaults.string(forKey: Key.mobileFileName) ?? "MobileDeviceTemplate.csv"
         preloadFileName = defaults.string(forKey: Key.preloadFileName) ?? "inventory-preload-template.csv"
-        incremental = defaults.object(forKey: Key.incremental) as? Bool ?? false
 
         if let data = defaults.data(forKey: Key.vendors),
            let saved = try? JSONDecoder().decode([VendorEntry].self, from: data) {
@@ -135,7 +132,7 @@ final class SettingsStore {
     func clearAll() {
         for key in [Key.clientID, Key.keyID, Key.keyIDVerified, Key.mode, Key.deviceFilter, Key.familyFilter,
                     Key.computerFileName, Key.mobileFileName, Key.preloadFileName,
-                    Key.incremental, Key.vendors, Key.pemBookmark, Key.outputBookmark] {
+                    Key.vendors, Key.pemBookmark, Key.outputBookmark] {
             defaults.removeObject(forKey: key)
         }
         clientID = ""
@@ -147,7 +144,6 @@ final class SettingsStore {
         computerFileName = "ComputerTemplate.csv"
         mobileFileName = "MobileDeviceTemplate.csv"
         preloadFileName = "inventory-preload-template.csv"
-        incremental = false
         vendors = Self.defaultVendors
         pemURL = nil
         outputURL = nil

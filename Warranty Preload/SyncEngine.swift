@@ -16,6 +16,7 @@ struct SyncStats {
     var newComputers = 0
     var newMobile = 0
     var skipped = 0
+    var copied = 0
     var filtered = 0
     var coverageErrors = 0
     var pages = 0
@@ -155,14 +156,14 @@ final class SyncEngine {
         // Authenticate before touching any output files.
         guard let client = await authenticatedClient(settings: settings) else { return }
 
-        // Prepare output files (fresh or incremental).
-        let computerFile = CSVFile(url: computerURL, header: Self.computerHeader, serialHeader: "Computer Serial")
-        let mobileFile = CSVFile(url: mobileURL, header: Self.mobileHeader, serialHeader: "Mobile Device Serial")
-        let preloadFile = CSVFile(url: preloadURL, header: Self.preloadHeader, serialHeader: "Serial Number")
+        // Always read existing files first so devices already present are never downloaded again.
+        let computerFile = CSVFile(url: computerURL, header: Self.computerHeader, columns: .computerTemplate)
+        let mobileFile = CSVFile(url: mobileURL, header: Self.mobileHeader, columns: .mobileTemplate)
+        let preloadFile = CSVFile(url: preloadURL, header: Self.preloadHeader, columns: .inventoryPreload)
         do {
-            if wantComputer { try prepare(computerFile, incremental: settings.incremental) }
-            if wantMobile { try prepare(mobileFile, incremental: settings.incremental) }
-            try prepare(preloadFile, incremental: settings.incremental)
+            if wantComputer { try prepare(computerFile) }
+            if wantMobile { try prepare(mobileFile) }
+            try prepare(preloadFile)
         } catch {
             return fail("Could not prepare output files: \(error.localizedDescription)")
         }
@@ -207,9 +208,29 @@ final class SyncEngine {
                     if (isMac && !wantComputer) || (!isMac && !wantMobile) { stats.filtered += 1; continue }
 
                     let templateFile = isMac ? computerFile : mobileFile
-                    let needsTemplate = !templateFile.knownSerials.contains(device.serial)
-                    let needsPreload = !preloadFile.knownSerials.contains(device.serial)
+                    let templateRecord = templateFile.records[device.serial]
+                    let preloadRecord = preloadFile.records[device.serial]
+                    let needsTemplate = templateRecord == nil
+                    let needsPreload = preloadRecord == nil
                     guard needsTemplate || needsPreload else { stats.skipped += 1; continue }
+
+                    // Already in the other file? Copy its data instead of calling the API again.
+                    // Template rows are always complete; preload rows only count if they hold purchase data
+                    // (older preload files may contain just the vendor).
+                    if let existing = templateRecord ?? preloadRecord.flatMap({ $0.hasPurchaseData ? $0 : nil }) {
+                        let info = PurchaseInfo(
+                            serial: device.serial,
+                            orderNumber: existing.orderNumber.isEmpty ? device.orderNumber : existing.orderNumber,
+                            orderDate: existing.orderDate.isEmpty ? device.orderDate : existing.orderDate,
+                            vendor: existing.vendor.isEmpty ? await vendorDisplay(for: device) : existing.vendor,
+                            warranty: existing.warranty,
+                            appleCareID: existing.appleCareID)
+                        try write(info, isMac: isMac, toTemplate: needsTemplate ? templateFile : nil,
+                                  toPreload: needsPreload ? preloadFile : nil)
+                        stats.copied += 1
+                        append(.info, "\(device.serial) — copied from existing \(needsTemplate ? preloadFile.url.lastPathComponent : templateFile.url.lastPathComponent)")
+                        continue
+                    }
 
                     statusText = "Processing \(device.serial)…"
                     let vendor = await vendorDisplay(for: device)
@@ -234,16 +255,11 @@ final class SyncEngine {
                         append(.error, "Coverage unavailable for \(device.serial): \(error.localizedDescription)")
                     }
 
-                    if needsTemplate {
-                        let row = isMac
-                            ? computerRow(device, vendor: vendor, warranty: warrantyExpires, appleCareID: appleCareID)
-                            : mobileRow(device, vendor: vendor, warranty: warrantyExpires, appleCareID: appleCareID)
-                        try templateFile.append(row: row)
-                        if isMac { stats.newComputers += 1 } else { stats.newMobile += 1 }
-                    }
-                    if needsPreload {
-                        try preloadFile.append(row: preloadRow(device, isMac: isMac, vendor: vendor, warranty: warrantyExpires, appleCareID: appleCareID))
-                    }
+                    let info = PurchaseInfo(serial: device.serial, orderNumber: device.orderNumber,
+                                            orderDate: device.orderDate, vendor: vendor,
+                                            warranty: warrantyExpires, appleCareID: appleCareID)
+                    try write(info, isMac: isMac, toTemplate: needsTemplate ? templateFile : nil,
+                              toPreload: needsPreload ? preloadFile : nil)
                     append(.success, "\(device.serial) (\(device.productFamily)) — \(vendor.isEmpty ? "no vendor" : vendor)")
 
                     try await Task.sleep(for: deviceDelay)
@@ -265,7 +281,7 @@ final class SyncEngine {
 
         finish(files: [wantComputer ? computerFile : nil, wantMobile ? mobileFile : nil, preloadFile])
         statusText = "Complete"
-        append(.success, "Sync complete — \(stats.totalDevices) devices in \(settings.mode == .abm ? "ABM" : "ASM"), \(stats.newComputers) computers / \(stats.newMobile) mobile written, \(stats.skipped) already present, \(stats.filtered) filtered, \(stats.coverageErrors) coverage errors.")
+        append(.success, "Sync complete — \(stats.totalDevices) devices in \(settings.mode == .abm ? "ABM" : "ASM"), \(stats.newComputers) computers / \(stats.newMobile) mobile written, \(stats.skipped) already present, \(stats.copied) copied between files, \(stats.filtered) filtered, \(stats.coverageErrors) coverage errors.")
     }
 
     private func fail(_ message: String) {
@@ -278,10 +294,11 @@ final class SyncEngine {
         for url in writtenFiles { append(.info, "Output: \(url.lastPathComponent)") }
     }
 
-    private func prepare(_ file: CSVFile, incremental: Bool) throws {
-        if incremental, FileManager.default.fileExists(atPath: file.url.path) {
-            try file.loadKnownSerials()
-            append(.info, "\(file.url.lastPathComponent): \(file.knownSerials.count) existing serials — appending new devices only")
+    /// Loads an existing file's rows (so those devices are skipped), or creates the file with its header.
+    private func prepare(_ file: CSVFile) throws {
+        if FileManager.default.fileExists(atPath: file.url.path) {
+            try file.loadExisting()
+            append(.info, "\(file.url.lastPathComponent): \(file.records.count) existing devices read — only new devices will be added")
         } else {
             try file.create()
             append(.info, "Created \(file.url.lastPathComponent)")
@@ -290,37 +307,48 @@ final class SyncEngine {
 
     // MARK: - Row builders
 
-    private func computerRow(_ d: OrgDevice, vendor: String, warranty: String, appleCareID: String) -> [CSVField] {
+    /// Appends the missing row(s) for a device.
+    private func write(_ info: PurchaseInfo, isMac: Bool, toTemplate templateFile: CSVFile?, toPreload preloadFile: CSVFile?) throws {
+        if let templateFile {
+            try templateFile.append(row: isMac ? computerRow(info) : mobileRow(info))
+            if isMac { stats.newComputers += 1 } else { stats.newMobile += 1 }
+        }
+        if let preloadFile {
+            try preloadFile.append(row: preloadRow(info, isMac: isMac))
+        }
+    }
+
+    private func computerRow(_ info: PurchaseInfo) -> [CSVField] {
         var row = [CSVField](repeating: .empty, count: Self.computerHeader.count)
-        row[0] = .quoted(d.serial)
-        row[13] = .quoted(d.orderNumber)
-        row[14] = .quoted(vendor)
-        row[16] = .quoted(d.orderDate)
-        row[17] = .quoted(warranty)
-        row[20] = .quoted(appleCareID)
+        row[0] = .quoted(info.serial)
+        row[13] = .quoted(info.orderNumber)
+        row[14] = .quoted(info.vendor)
+        row[16] = .quoted(info.orderDate)
+        row[17] = .quoted(info.warranty)
+        row[20] = .quoted(info.appleCareID)
         return row
     }
 
-    private func mobileRow(_ d: OrgDevice, vendor: String, warranty: String, appleCareID: String) -> [CSVField] {
+    private func mobileRow(_ info: PurchaseInfo) -> [CSVField] {
         var row = [CSVField](repeating: .empty, count: Self.mobileHeader.count)
-        row[0] = .quoted(d.serial)
-        row[12] = .quoted(d.orderNumber)
-        row[13] = .quoted(vendor)
-        row[15] = .quoted(d.orderDate)
-        row[16] = .quoted(warranty)
-        row[19] = .quoted(appleCareID)
+        row[0] = .quoted(info.serial)
+        row[12] = .quoted(info.orderNumber)
+        row[13] = .quoted(info.vendor)
+        row[15] = .quoted(info.orderDate)
+        row[16] = .quoted(info.warranty)
+        row[19] = .quoted(info.appleCareID)
         return row
     }
 
-    private func preloadRow(_ d: OrgDevice, isMac: Bool, vendor: String, warranty: String, appleCareID: String) -> [CSVField] {
+    private func preloadRow(_ info: PurchaseInfo, isMac: Bool) -> [CSVField] {
         var row = [CSVField](repeating: .empty, count: Self.preloadHeader.count)
-        row[0] = .plain(d.serial)
+        row[0] = .plain(info.serial)
         row[1] = .plain(isMac ? "Computer" : "Mobile Device")
-        row[10] = .plain(d.orderNumber)
-        row[11] = .plain(d.orderDate)
-        row[12] = .plain(warranty)
-        row[13] = .plain(appleCareID)
-        row[17] = .plain(vendor)          // Purchasing Contact (matches existing preload template)
+        row[10] = .plain(info.orderNumber)
+        row[11] = .plain(info.orderDate)
+        row[12] = .plain(info.warranty)
+        row[13] = .plain(info.appleCareID)
+        row[17] = .plain(info.vendor)          // Purchasing Contact (matches existing preload template)
         return row
     }
 
@@ -360,34 +388,94 @@ enum CSVField {
     }
 }
 
+/// The purchase data written for one device.
+struct PurchaseInfo {
+    var serial: String
+    var orderNumber: String
+    var orderDate: String
+    var vendor: String
+    var warranty: String
+    var appleCareID: String
+
+    /// True when the row holds more than just a serial/vendor (i.e. coverage or order data was captured).
+    var hasPurchaseData: Bool {
+        !orderNumber.isEmpty || !orderDate.isEmpty || !warranty.isEmpty || !appleCareID.isEmpty
+    }
+}
+
+/// Which header names hold each value in a given template.
+struct CSVColumns {
+    let serial: String
+    let orderNumber: String
+    let orderDate: String
+    let vendor: [String]        // first non-empty wins
+    let warranty: String
+    let appleCareID: String
+
+    static let computerTemplate = CSVColumns(serial: "Computer Serial", orderNumber: "PO Number", orderDate: "PO Date",
+                                             vendor: ["Vendor"], warranty: "Warranty Expires", appleCareID: "AppleCare ID")
+    static let mobileTemplate = CSVColumns(serial: "Mobile Device Serial", orderNumber: "PO Number", orderDate: "PO Date",
+                                           vendor: ["Vendor"], warranty: "Warranty Expires", appleCareID: "AppleCare ID")
+    static let inventoryPreload = CSVColumns(serial: "Serial Number", orderNumber: "PO Number", orderDate: "PO Date",
+                                             vendor: ["Purchasing Contact", "Vendor"], warranty: "Warranty Expiration",
+                                             appleCareID: "Apple Care ID")
+}
+
 /// An output CSV file that is written incrementally (row by row) so progress survives interruption.
+/// Existing rows are read first so those devices are not downloaded again.
 final class CSVFile {
     let url: URL
     let header: [String]
-    let serialHeader: String
-    private(set) var knownSerials: Set<String> = []
+    let columns: CSVColumns
+    /// Existing rows keyed by serial number.
+    private(set) var records: [String: PurchaseInfo] = [:]
 
-    init(url: URL, header: [String], serialHeader: String) {
+    init(url: URL, header: [String], columns: CSVColumns) {
         self.url = url
         self.header = header
-        self.serialHeader = serialHeader
+        self.columns = columns
     }
 
     func create() throws {
         try (header.joined(separator: ",") + "\n").write(to: url, atomically: true, encoding: .utf8)
-        knownSerials = []
+        records = [:]
     }
 
-    /// Reads the first column of an existing file so already-present serials can be skipped.
-    func loadKnownSerials() throws {
+    /// Parses an existing file. The header must match the template so appended rows line up.
+    func loadExisting() throws {
         let contents = try String(contentsOf: url, encoding: .utf8)
-        var serials = Set<String>()
-        for line in contents.split(whereSeparator: \.isNewline) {
-            let first = line.split(separator: ",", maxSplits: 1, omittingEmptySubsequences: false).first ?? ""
-            let serial = first.replacingOccurrences(of: "\"", with: "").trimmingCharacters(in: .whitespaces)
-            if !serial.isEmpty && serial != serialHeader { serials.insert(serial) }
+        let rows = CSVParser.parse(contents)
+
+        guard let fileHeader = rows.first?.map({ $0.trimmingCharacters(in: .whitespaces) }) else {
+            // Empty file: just write the header.
+            return try create()
         }
-        knownSerials = serials
+        guard fileHeader == header else {
+            throw CocoaError(.fileReadCorruptFile, userInfo: [
+                NSLocalizedDescriptionKey: "\(url.lastPathComponent) has different columns from the expected template. Rename or move it so a new file can be created."
+            ])
+        }
+
+        let index = Dictionary(fileHeader.enumerated().map { ($1, $0) }, uniquingKeysWith: { first, _ in first })
+        func value(_ row: [String], _ name: String) -> String {
+            guard let i = index[name], i < row.count else { return "" }
+            return row[i].trimmingCharacters(in: .whitespaces)
+        }
+
+        var loaded: [String: PurchaseInfo] = [:]
+        for row in rows.dropFirst() {
+            let serial = value(row, columns.serial)
+            guard !serial.isEmpty else { continue }
+            loaded[serial] = PurchaseInfo(
+                serial: serial,
+                orderNumber: value(row, columns.orderNumber),
+                orderDate: value(row, columns.orderDate),
+                vendor: columns.vendor.lazy.map { value(row, $0) }.first { !$0.isEmpty } ?? "",
+                warranty: value(row, columns.warranty),
+                appleCareID: value(row, columns.appleCareID))
+        }
+        records = loaded
+
         // Make sure appended rows start on a new line.
         if !contents.isEmpty && !contents.hasSuffix("\n") {
             try appendRaw("\n")
@@ -396,8 +484,14 @@ final class CSVFile {
 
     func append(row: [CSVField]) throws {
         try appendRaw(row.map(\.encoded).joined(separator: ",") + "\n")
-        if case .quoted(let serial) = row.first { knownSerials.insert(serial) }
-        if case .plain(let serial) = row.first { knownSerials.insert(serial) }
+        // Track the serial so the same device is never written twice in one run.
+        switch row.first {
+        case .quoted(let serial), .plain(let serial):
+            records[serial] = records[serial] ?? PurchaseInfo(serial: serial, orderNumber: "", orderDate: "",
+                                                              vendor: "", warranty: "", appleCareID: "")
+        default:
+            break
+        }
     }
 
     private func appendRaw(_ text: String) throws {
@@ -405,5 +499,50 @@ final class CSVFile {
         defer { try? handle.close() }
         try handle.seekToEnd()
         try handle.write(contentsOf: Data(text.utf8))
+    }
+}
+
+/// Minimal RFC 4180 CSV parser (quoted fields, escaped quotes, embedded commas/newlines, CRLF, BOM).
+enum CSVParser {
+    static func parse(_ text: String) -> [[String]] {
+        var rows: [[String]] = []
+        var row: [String] = []
+        var field = ""
+        var inQuotes = false
+        var iterator = text.unicodeScalars.makeIterator()
+        var pending: Unicode.Scalar? = nil
+
+        func endField() { row.append(field); field = "" }
+        func endRow() {
+            endField()
+            if !(row.count == 1 && row[0].isEmpty) { rows.append(row) }
+            row = []
+        }
+
+        while let c = pending ?? iterator.next() {
+            pending = nil
+            if inQuotes {
+                if c == "\"" {
+                    let next = iterator.next()
+                    if next == "\"" { field.unicodeScalars.append("\"") } else { inQuotes = false; pending = next }
+                } else {
+                    field.unicodeScalars.append(c)
+                }
+                continue
+            }
+            switch c {
+            case "\"": inQuotes = true
+            case ",": endField()
+            case "\r":
+                let next = iterator.next()
+                if next != "\n" { pending = next }
+                endRow()
+            case "\n": endRow()
+            case "\u{FEFF}" where field.isEmpty && row.isEmpty && rows.isEmpty: break   // BOM
+            default: field.unicodeScalars.append(c)
+            }
+        }
+        if !field.isEmpty || !row.isEmpty { endRow() }
+        return rows
     }
 }

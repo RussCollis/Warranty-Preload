@@ -67,7 +67,7 @@ private struct SettingsPane: View {
                 }
             }
 
-            Section("Output") {
+            Section {
                 LabeledContent("Output Folder") {
                     HStack {
                         Text(settings.outputURL?.lastPathComponent ?? "Not selected")
@@ -90,7 +90,12 @@ private struct SettingsPane: View {
                     ForEach(DeviceFilter.allCases) { Text($0.title).tag($0) }
                 }
                 TextField("Product Families", text: $settings.familyFilter, prompt: Text("Optional, e.g. Mac, iPad"))
-                Toggle("Only add new devices (keep existing files)", isOn: $settings.incremental)
+            } header: {
+                Text("Output")
+            } footer: {
+                Text("Existing files in the output folder are always read first. Devices already listed are skipped, so only new devices are downloaded.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section {
@@ -205,6 +210,7 @@ private struct StatsGrid: View {
             }
             GridRow {
                 stat("Already present", stats.skipped)
+                stat("Copied", stats.copied)
                 stat("Filtered", stats.filtered)
                 stat("Coverage errors", stats.coverageErrors)
             }

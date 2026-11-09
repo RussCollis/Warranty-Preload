@@ -88,10 +88,20 @@ Default entries:
 - **AppleCare ID** is the agreement number of the active AppleCare plan. If no plan is active, the first AppleCare plan returned by ABM is used.
 - If coverage can't be retrieved for a device, its row is still written with the PO fields, and it is counted under **Coverage errors**.
 
-### Fresh vs incremental runs
+### Existing data is always read first
 
-- **Off (default):** each sync creates new files and overwrites any existing ones.
-- **"Only add new devices (keep existing files)":** reads the serials already in each file and appends only devices that are missing. This mirrors the script's incremental mode and is much faster on large estates.
+Before downloading anything, the app reads the Computer Template (or Mobile Device Template) and the Inventory Preload file already in the output folder:
+
+| Device is… | Result |
+| --- | --- |
+| In **both** files | Skipped. No API calls. |
+| In **one** file only | The missing row is **copied from the existing row**. No coverage call. |
+| In **neither** file | Coverage is downloaded from ABM and appended to both files. |
+
+- The device list itself still has to be paged from ABM each run so that new devices can be found. The per-device coverage lookups, which take most of the time, only happen for new devices.
+- A preload row only counts as a copy source if it contains purchase data (PO number, PO date, warranty or AppleCare ID). Rows with just a vendor, like the older preload files, still trigger a coverage download for the template.
+- Existing files must have the **expected column headers**. If a file's columns differ, the sync stops rather than appending misaligned rows.
+- To start completely fresh, move or rename the existing files, or set new file names.
 
 Rows are written as each device is processed, so a cancelled or interrupted run keeps everything written up to that point.
 
