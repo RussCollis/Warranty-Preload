@@ -179,25 +179,29 @@ if [[ "$MAKE_DMG" == true ]]; then
     ditto "$DIST_APP" "${STAGING}/${APP_NAME}.app"
     ln -s /Applications "${STAGING}/Applications"
     # `diskutil image` replaces the deprecated `hdiutil create` on newer macOS; fall back for older systems.
+    dmg_ok=false
     if diskutil image create from -h >/dev/null 2>&1; then
-        diskutil image create from --format UDZO --volumeName "$APP_NAME" "$STAGING" "$DMG_PATH" >/dev/null \
-            || fail "DMG creation failed."
+        diskutil image create from --format UDZO --volumeName "$APP_NAME" "$STAGING" "$DMG_PATH" >/dev/null && dmg_ok=true
     else
-        hdiutil create -volname "$APP_NAME" -srcfolder "$STAGING" -ov -format UDZO "$DMG_PATH" >/dev/null \
-            || fail "DMG creation failed."
+        hdiutil create -volname "$APP_NAME" -srcfolder "$STAGING" -ov -format UDZO "$DMG_PATH" >/dev/null && dmg_ok=true
     fi
     rm -rf "$STAGING"
 
-    if [[ "$SIGN_IDENTITY" != "-" ]]; then
-        codesign --sign "$SIGN_IDENTITY" --timestamp "$DMG_PATH"
+    if [[ "$dmg_ok" == true ]]; then
+        if [[ "$SIGN_IDENTITY" != "-" ]]; then
+            codesign --sign "$SIGN_IDENTITY" --timestamp "$DMG_PATH"
+        fi
+        if [[ -n "$NOTARY_PROFILE" ]]; then
+            info "Notarizing DMG…"
+            xcrun notarytool submit "$DMG_PATH" --keychain-profile "$NOTARY_PROFILE" --wait \
+                && xcrun stapler staple "$DMG_PATH" \
+                || fail "DMG notarization failed."
+        fi
+        info "DMG: $DMG_PATH"
+    else
+        # Not fatal: the .app and .zip are already built.
+        warn "DMG creation failed (disk image service unavailable?). The .app and .zip are still in ${DIST_DIR}."
     fi
-    if [[ -n "$NOTARY_PROFILE" ]]; then
-        info "Notarizing DMG…"
-        xcrun notarytool submit "$DMG_PATH" --keychain-profile "$NOTARY_PROFILE" --wait \
-            && xcrun stapler staple "$DMG_PATH" \
-            || fail "DMG notarization failed."
-    fi
-    info "DMG: $DMG_PATH"
 fi
 
 if [[ "$SIGN_IDENTITY" == "-" ]]; then

@@ -118,15 +118,55 @@ Rows are written as each device is processed, so a cancelled or interrupted run 
 
 ---
 
+## Building
+
+Use `build.sh` in the repository root. It builds Release and writes the output to `dist/`. Both `build/` and `dist/` are git-ignored.
+
+```zsh
+./build.sh                 # ad-hoc signed .app + .zip (this Mac / internal testing)
+./build.sh --dmg           # also create a .dmg
+./build.sh --clean         # remove previous build output first
+./build.sh --version 1.1   # set the marketing version (build number defaults to the git commit count)
+```
+
+### Distribution (Developer ID + notarization)
+
+Store the notarization credentials once:
+
+```zsh
+xcrun notarytool store-credentials NotaryProfile --apple-id you@example.com --team-id ABCDE12345
+```
+
+Then build, sign and notarize:
+
+```zsh
+./build.sh --sign "Developer ID Application" --team ABCDE12345 --notarize NotaryProfile --dmg
+```
+
+| Option | Description |
+| --- | --- |
+| `--sign IDENTITY` | Code signing identity (default: ad-hoc). Requires `--team`. Enables Hardened Runtime. |
+| `--team TEAM_ID` | Apple Developer Team ID |
+| `--bundle-id ID` | Override the bundle identifier. Saved settings are tied to the bundle ID, so changing it starts with fresh settings. |
+| `--version X.Y.Z` | Marketing version |
+| `--build-number N` | Build number |
+| `--notarize PROFILE` | Notarize and staple with a `notarytool` keychain profile |
+| `--dmg` | Also produce a `.dmg`. A DMG failure only produces a warning; the `.app` and `.zip` are still created. |
+| `--clean` | Delete `build/` and `dist/` first |
+
+Ad-hoc builds run on the Mac that built them, but Gatekeeper blocks them on other Macs. Use Developer ID signing and notarization to distribute the app.
+
+---
+
 ## Project structure
 
 | File | Purpose |
 | --- | --- |
-| `MyApp/MyApp.swift` | App entry point |
-| `MyApp/ContentView.swift` | User interface (settings, vendor table, activity log) |
-| `MyApp/SettingsStore.swift` | Saved settings, vendor list, file access |
-| `MyApp/ABMClient.swift` | JWT signing (CryptoKit ES256), OAuth token, API calls with retry/backoff |
-| `MyApp/SyncEngine.swift` | Sync process, coverage logic, CSV writing |
+| `Warranty Preload/MyApp.swift` | App entry point |
+| `Warranty Preload/ContentView.swift` | User interface (settings, vendor table, activity log) |
+| `Warranty Preload/SettingsStore.swift` | Saved settings, vendor list, file access |
+| `Warranty Preload/ABMClient.swift` | JWT signing (CryptoKit ES256), OAuth token, API calls with retry/backoff |
+| `Warranty Preload/SyncEngine.swift` | Sync process, coverage logic, CSV writing |
 
 The app is sandboxed. It is allowed outgoing network connections and read/write access to files and folders you select.
 
