@@ -20,6 +20,10 @@ struct SyncStats {
     var filtered = 0
     var coverageErrors = 0
     var pages = 0
+    var jamfUpdated = 0
+    var jamfUpToDate = 0
+    var jamfNotFound = 0
+    var jamfErrors = 0
 }
 
 /// Runs the ABM/ASM pull and writes the Jamf templates:
@@ -35,6 +39,11 @@ final class SyncEngine {
     private(set) var writtenFiles: [URL] = []
 
     private var task: Task<Void, Never>?
+
+    /// Jamf Pro connection and inventory (keyed by serial) for the current run, when enabled.
+    private var jamf: JamfClient?
+    private var jamfDevices: [String: JamfDevice] = [:]
+    private var jamfOverwrite = false
 
     // Pacing (matches the original script).
     private let deviceDelay: Duration = .milliseconds(100)
@@ -71,9 +80,11 @@ final class SyncEngine {
             isRunning = true
             defer { isRunning = false }
             append(.info, "Testing connection to \(settings.mode.title)…")
-            if await authenticatedClient(settings: settings) != nil {
-                statusText = "Connection OK"
+            guard await authenticatedClient(settings: settings) != nil else { return }
+            if settings.jamfEnabled {
+                guard await authenticatedJamfClient(settings: settings) != nil else { return }
             }
+            statusText = "Connection OK"
         }
     }
 
@@ -111,6 +122,101 @@ final class SyncEngine {
         }
     }
 
+    /// Creates a Jamf Pro client and requests a token.
+    private func authenticatedJamfClient(settings: SettingsStore) async -> JamfClient? {
+        guard settings.jamfConfigured else {
+            fail("Jamf Pro URL, API Client ID and Client Secret are required.")
+            return nil
+        }
+        do {
+            let client = try JamfClient(url: settings.jamfURL,
+                                        clientID: settings.jamfClientID.trimmingCharacters(in: .whitespacesAndNewlines),
+                                        clientSecret: settings.jamfClientSecret) { [weak self] message in
+                Task { @MainActor [weak self] in self?.append(.warning, message) }
+            }
+            append(.info, "Requesting Jamf Pro token…")
+            try await client.authenticate()
+            append(.success, "Jamf Pro token obtained")
+            return client
+        } catch {
+            fail(error.localizedDescription)
+            return nil
+        }
+    }
+
+    /// Authenticates to Jamf Pro and loads the inventory needed for this run.
+    private func prepareJamf(settings: SettingsStore, computers: Bool, mobile: Bool) async -> Bool {
+        guard let client = await authenticatedJamfClient(settings: settings) else { return false }
+        do {
+            statusText = "Reading Jamf Pro inventory…"
+            var devices: [String: JamfDevice] = [:]
+            if computers {
+                let found = try await client.fetchComputers()
+                append(.info, "Jamf Pro: \(found.count) computers")
+                devices.merge(found) { first, _ in first }
+            }
+            if mobile {
+                let found = try await client.fetchMobileDevices()
+                append(.info, "Jamf Pro: \(found.count) mobile devices")
+                devices.merge(found) { first, _ in first }
+            }
+            jamf = client
+            jamfDevices = devices
+            jamfOverwrite = settings.jamfOverwrite
+            return true
+        } catch {
+            fail("Could not read Jamf Pro inventory: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// Writes a device's purchase data to its Jamf Pro record when it differs.
+    /// Errors are logged and counted; only cancellation is rethrown.
+    private func syncToJamf(_ info: PurchaseInfo, isMac: Bool) async throws {
+        guard let jamf else { return }
+        guard let device = jamfDevices[info.serial], device.isMac == isMac else {
+            stats.jamfNotFound += 1
+            return
+        }
+
+        // Only fields with an ABM value that differ (or, without overwrite, are empty in Jamf).
+        func change(_ new: String, _ current: String) -> String {
+            let new = new.trimmingCharacters(in: .whitespaces)
+            guard !new.isEmpty, new != current else { return "" }
+            return jamfOverwrite || current.isEmpty ? new : ""
+        }
+        let current = device.purchasing
+        let changes = JamfPurchasing(
+            poNumber: change(info.orderNumber, current.poNumber),
+            poDate: change(info.orderDate, current.poDate),
+            vendor: change(info.vendor, current.vendor),
+            warrantyDate: change(info.warranty, current.warrantyDate),
+            appleCareID: change(info.appleCareID, current.appleCareID))
+        guard changes != JamfPurchasing() else {
+            stats.jamfUpToDate += 1
+            return
+        }
+
+        do {
+            try await jamf.updatePurchasing(device, changes: changes)
+            stats.jamfUpdated += 1
+            append(.success, "\(info.serial) — updated in Jamf Pro")
+            // Keep the cached copy current in case the serial appears again.
+            var updated = device
+            for (keyPath, value) in [(\JamfPurchasing.poNumber, changes.poNumber), (\.poDate, changes.poDate),
+                                     (\.vendor, changes.vendor), (\.warrantyDate, changes.warrantyDate),
+                                     (\.appleCareID, changes.appleCareID)] where !value.isEmpty {
+                updated.purchasing[keyPath: keyPath] = value
+            }
+            jamfDevices[info.serial] = updated
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            stats.jamfErrors += 1
+            append(.error, "Jamf Pro update failed for \(info.serial): \(error.localizedDescription)")
+        }
+    }
+
     // MARK: - Run
 
     private func run(settings: SettingsStore) async {
@@ -118,8 +224,12 @@ final class SyncEngine {
         stats = SyncStats()
         writtenFiles = []
         let started = Date()
+        jamf = nil
+        jamfDevices = [:]
         defer {
             isRunning = false
+            jamf = nil
+            jamfDevices = [:]
             let elapsed = Duration.seconds(Date().timeIntervalSince(started))
             append(.info, "Runtime: \(elapsed.formatted(.time(pattern: .hourMinuteSecond)))")
         }
@@ -155,6 +265,9 @@ final class SyncEngine {
 
         // Authenticate before touching any output files.
         guard let client = await authenticatedClient(settings: settings) else { return }
+        if settings.jamfEnabled {
+            guard await prepareJamf(settings: settings, computers: wantComputer, mobile: wantMobile) else { return }
+        }
 
         // Always read existing files first so devices already present are never downloaded again.
         let computerFile = CSVFile(url: computerURL, header: Self.computerHeader, columns: .computerTemplate)
@@ -212,7 +325,13 @@ final class SyncEngine {
                     let preloadRecord = preloadFile.records[device.serial]
                     let needsTemplate = templateRecord == nil
                     let needsPreload = preloadRecord == nil
-                    guard needsTemplate || needsPreload else { stats.skipped += 1; continue }
+                    guard needsTemplate || needsPreload else {
+                        stats.skipped += 1
+                        if let existing = templateRecord ?? preloadRecord {
+                            try await syncToJamf(existing, isMac: isMac)
+                        }
+                        continue
+                    }
 
                     // Already in the other file? Copy its data instead of calling the API again.
                     // Template rows are always complete; preload rows only count if they hold purchase data
@@ -228,6 +347,7 @@ final class SyncEngine {
                         try write(info, isMac: isMac, toTemplate: needsTemplate ? templateFile : nil,
                                   toPreload: needsPreload ? preloadFile : nil)
                         stats.copied += 1
+                        try await syncToJamf(info, isMac: isMac)
                         append(.info, "\(device.serial) — copied from existing \(needsTemplate ? preloadFile.url.lastPathComponent : templateFile.url.lastPathComponent)")
                         continue
                     }
@@ -261,6 +381,7 @@ final class SyncEngine {
                     try write(info, isMac: isMac, toTemplate: needsTemplate ? templateFile : nil,
                               toPreload: needsPreload ? preloadFile : nil)
                     append(.success, "\(device.serial) (\(device.productFamily)) — \(vendor.isEmpty ? "no vendor" : vendor)")
+                    try await syncToJamf(info, isMac: isMac)
 
                     try await Task.sleep(for: deviceDelay)
                 }
@@ -282,6 +403,9 @@ final class SyncEngine {
         finish(files: [wantComputer ? computerFile : nil, wantMobile ? mobileFile : nil, preloadFile])
         statusText = "Complete"
         append(.success, "Sync complete — \(stats.totalDevices) devices in \(settings.mode == .abm ? "ABM" : "ASM"), \(stats.newComputers) computers / \(stats.newMobile) mobile written, \(stats.skipped) already present, \(stats.copied) copied between files, \(stats.filtered) filtered, \(stats.coverageErrors) coverage errors.")
+        if settings.jamfEnabled {
+            append(.success, "Jamf Pro — \(stats.jamfUpdated) updated, \(stats.jamfUpToDate) already up to date, \(stats.jamfNotFound) not in Jamf, \(stats.jamfErrors) errors.")
+        }
     }
 
     private func fail(_ message: String) {

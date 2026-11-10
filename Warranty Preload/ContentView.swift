@@ -134,6 +134,22 @@ private struct SettingsPane: View {
             }
 
             Section {
+                Toggle("Update Jamf Pro devices automatically", isOn: $settings.jamfEnabled)
+                if settings.jamfEnabled {
+                    TextField("Jamf Pro URL", text: $settings.jamfURL, prompt: Text("https://yourorg.jamfcloud.com"))
+                    TextField("API Client ID", text: $settings.jamfClientID)
+                    SecureField("Client Secret", text: $settings.jamfClientSecret)
+                    Toggle("Overwrite values already set in Jamf", isOn: $settings.jamfOverwrite)
+                }
+            } header: {
+                Text("Jamf Pro")
+            } footer: {
+                Text("Each sync writes PO number, PO date, vendor, warranty date and AppleCare ID to matching computers and mobile devices in Jamf Pro (by serial number). Only changed fields are sent. The API role needs Read and Update for Computers and Mobile Devices. The secret is stored in the Keychain.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
                 Button("Clear Saved Settings…", role: .destructive) { showingClearConfirmation = true }
             }
         }
@@ -142,7 +158,7 @@ private struct SettingsPane: View {
         .confirmationDialog("Clear all saved settings?", isPresented: $showingClearConfirmation) {
             Button("Clear Settings", role: .destructive) { settings.clearAll() }
         } message: {
-            Text("This removes the Client ID, Key ID, .pem location, output folder and custom vendors.")
+            Text("This removes the Client ID, Key ID, .pem location, output folder, custom vendors and Jamf Pro settings.")
         }
     }
 }
@@ -156,6 +172,7 @@ private struct ActivityPane: View {
     private var canRun: Bool {
         !settings.clientID.isEmpty && !settings.keyID.isEmpty
             && settings.pemURL != nil && settings.outputURL != nil
+            && (!settings.jamfEnabled || settings.jamfConfigured)
     }
 
     var body: some View {
@@ -178,7 +195,7 @@ private struct ActivityPane: View {
                 Spacer()
             }
 
-            StatsGrid(stats: engine.stats)
+            StatsGrid(stats: engine.stats, showJamf: settings.jamfEnabled)
 
             LogView(lines: engine.log)
 
@@ -200,6 +217,7 @@ private struct ActivityPane: View {
 
 private struct StatsGrid: View {
     let stats: SyncStats
+    let showJamf: Bool
 
     var body: some View {
         Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 4) {
@@ -213,6 +231,14 @@ private struct StatsGrid: View {
                 stat("Copied", stats.copied)
                 stat("Filtered", stats.filtered)
                 stat("Coverage errors", stats.coverageErrors)
+            }
+            if showJamf {
+                GridRow {
+                    stat("Jamf updated", stats.jamfUpdated)
+                    stat("Up to date", stats.jamfUpToDate)
+                    stat("Not in Jamf", stats.jamfNotFound)
+                    stat("Jamf errors", stats.jamfErrors)
+                }
             }
         }
         .font(.callout)

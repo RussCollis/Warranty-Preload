@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import Security
 
 /// A single purchase source (reseller) mapping: ABM `purchaseSourceId` -> display name.
 nonisolated struct VendorEntry: Identifiable, Codable, Hashable, Sendable {
@@ -55,6 +56,10 @@ final class SettingsStore {
         static let vendors = "vendors"
         static let pemBookmark = "pemBookmark"
         static let outputBookmark = "outputBookmark"
+        static let jamfEnabled = "jamfEnabled"
+        static let jamfURL = "jamfURL"
+        static let jamfClientID = "jamfClientID"
+        static let jamfOverwrite = "jamfOverwrite"
     }
 
     private let defaults = UserDefaults.standard
@@ -77,6 +82,21 @@ final class SettingsStore {
     var preloadFileName: String { didSet { defaults.set(preloadFileName, forKey: Key.preloadFileName) } }
     var vendors: [VendorEntry] { didSet { saveVendors() } }
 
+    /// Jamf Pro: when enabled, each sync also writes purchase data to matching Jamf devices.
+    var jamfEnabled: Bool { didSet { defaults.set(jamfEnabled, forKey: Key.jamfEnabled) } }
+    var jamfURL: String { didSet { defaults.set(jamfURL, forKey: Key.jamfURL) } }
+    var jamfClientID: String { didSet { defaults.set(jamfClientID, forKey: Key.jamfClientID) } }
+    /// Stored in the Keychain rather than UserDefaults.
+    var jamfClientSecret: String { didSet { Keychain.set(jamfClientSecret, account: Keychain.jamfSecretAccount) } }
+    /// When off, only fields that are empty in Jamf are filled in.
+    var jamfOverwrite: Bool { didSet { defaults.set(jamfOverwrite, forKey: Key.jamfOverwrite) } }
+
+    var jamfConfigured: Bool {
+        !jamfURL.trimmingCharacters(in: .whitespaces).isEmpty
+            && !jamfClientID.trimmingCharacters(in: .whitespaces).isEmpty
+            && !jamfClientSecret.isEmpty
+    }
+
     /// Resolved locations (from saved bookmarks).
     private(set) var pemURL: URL?
     private(set) var outputURL: URL?
@@ -91,6 +111,12 @@ final class SettingsStore {
         computerFileName = defaults.string(forKey: Key.computerFileName) ?? "ComputerTemplate.csv"
         mobileFileName = defaults.string(forKey: Key.mobileFileName) ?? "MobileDeviceTemplate.csv"
         preloadFileName = defaults.string(forKey: Key.preloadFileName) ?? "inventory-preload-template.csv"
+
+        jamfEnabled = defaults.bool(forKey: Key.jamfEnabled)
+        jamfURL = defaults.string(forKey: Key.jamfURL) ?? ""
+        jamfClientID = defaults.string(forKey: Key.jamfClientID) ?? ""
+        jamfClientSecret = Keychain.get(account: Keychain.jamfSecretAccount) ?? ""
+        jamfOverwrite = defaults.bool(forKey: Key.jamfOverwrite)
 
         if let data = defaults.data(forKey: Key.vendors),
            let saved = try? JSONDecoder().decode([VendorEntry].self, from: data) {
@@ -132,7 +158,8 @@ final class SettingsStore {
     func clearAll() {
         for key in [Key.clientID, Key.keyID, Key.keyIDVerified, Key.mode, Key.deviceFilter, Key.familyFilter,
                     Key.computerFileName, Key.mobileFileName, Key.preloadFileName,
-                    Key.vendors, Key.pemBookmark, Key.outputBookmark] {
+                    Key.vendors, Key.pemBookmark, Key.outputBookmark,
+                    Key.jamfEnabled, Key.jamfURL, Key.jamfClientID, Key.jamfOverwrite] {
             defaults.removeObject(forKey: key)
         }
         clientID = ""
@@ -147,7 +174,15 @@ final class SettingsStore {
         vendors = Self.defaultVendors
         pemURL = nil
         outputURL = nil
+        jamfEnabled = false
+        jamfURL = ""
+        jamfClientID = ""
+        jamfClientSecret = ""
+        jamfOverwrite = false
         defaults.removeObject(forKey: Key.vendors)
+        for key in [Key.jamfEnabled, Key.jamfURL, Key.jamfClientID, Key.jamfOverwrite] {
+            defaults.removeObject(forKey: key)
+        }
     }
 
     // MARK: - Persistence helpers
@@ -177,5 +212,43 @@ final class SettingsStore {
                                  bookmarkDataIsStale: &isStale) else { return nil }
         if isStale { saveBookmark(for: url, forKey: key) }
         return url
+    }
+}
+
+/// Minimal generic-password Keychain storage for secrets.
+nonisolated enum Keychain {
+    static let jamfSecretAccount = "jamfClientSecret"
+    private static let service = Bundle.main.bundleIdentifier ?? "PurchaseInformationSync"
+
+    private static func query(account: String) -> [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword,
+         kSecAttrService as String: service,
+         kSecAttrAccount as String: account]
+    }
+
+    static func get(account: String) -> String? {
+        var q = query(account: account)
+        q[kSecReturnData as String] = true
+        q[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: AnyObject?
+        guard SecItemCopyMatching(q as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    /// Saves the value, or deletes the item when the value is empty.
+    static func set(_ value: String, account: String) {
+        let q = query(account: account)
+        guard !value.isEmpty else {
+            SecItemDelete(q as CFDictionary)
+            return
+        }
+        let data = Data(value.utf8)
+        let status = SecItemUpdate(q as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        if status == errSecItemNotFound {
+            var add = q
+            add[kSecValueData as String] = data
+            SecItemAdd(add as CFDictionary, nil)
+        }
     }
 }
