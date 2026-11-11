@@ -7,12 +7,65 @@ struct ContentView: View {
 
     var body: some View {
         HSplitView {
+            BrandingPane()
+                .frame(width: 200)
             SettingsPane(settings: settings, isRunning: engine.isRunning)
                 .frame(minWidth: 460, idealWidth: 500)
             ActivityPane(settings: settings, engine: engine)
                 .frame(minWidth: 420)
         }
-        .frame(minWidth: 960, minHeight: 640)
+        .frame(minWidth: 1160, minHeight: 640)
+    }
+}
+
+// MARK: - Branding
+
+private struct BrandingPane: View {
+    /// e.g. "Version 1.0 (1)", read from the bundle so it tracks build.sh's --version / --build-number.
+    private var versionText: String {
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? "1.0"
+        let build = info?["CFBundleVersion"] as? String ?? "1"
+        return "Version \(version) (\(build))"
+    }
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Image("Logo")
+                .resizable()
+                .scaledToFit()
+                .frame(width: 140)
+                .shadow(color: .black.opacity(0.25), radius: 8, y: 4)
+                .padding(.top, 60)
+                .accessibilityHidden(true)
+
+            Text("Purchase Information Sync")
+                .font(.title3.bold())
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.white)
+                .padding(.horizontal)
+
+            Spacer()
+
+            Text(versionText)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.85))
+                .padding(.bottom, 20)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background {
+            // Blue → indigo palette picked to complement the ninja logo.
+            LinearGradient(
+                colors: [
+                    Color(red: 0.36, green: 0.66, blue: 0.98),
+                    Color(red: 0.16, green: 0.40, blue: 0.86),
+                    Color(red: 0.24, green: 0.18, blue: 0.62)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .ignoresSafeArea()
+        }
     }
 }
 
