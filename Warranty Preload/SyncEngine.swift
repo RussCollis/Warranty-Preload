@@ -44,6 +44,8 @@ final class SyncEngine {
     private var jamf: JamfClient?
     private var jamfDevices: [String: JamfDevice] = [:]
     private var jamfOverwrite = false
+    /// Serials already pushed to Jamf from the saved files before the ABM pull.
+    private var jamfSynced: Set<String> = []
 
     // Pacing (matches the original script).
     private let deviceDelay: Duration = .milliseconds(100)
@@ -174,8 +176,10 @@ final class SyncEngine {
     /// Errors are logged and counted; only cancellation is rethrown.
     private func syncToJamf(_ info: PurchaseInfo, isMac: Bool) async throws {
         guard let jamf else { return }
+        // Devices handled by the saved-file pass were already counted; only an actual change is reported again.
+        let alreadyCounted = jamfSynced.contains(info.serial)
         guard let device = jamfDevices[info.serial], device.isMac == isMac else {
-            stats.jamfNotFound += 1
+            if !alreadyCounted { stats.jamfNotFound += 1 }
             return
         }
 
@@ -193,7 +197,7 @@ final class SyncEngine {
             warrantyDate: change(info.warranty, current.warrantyDate),
             appleCareID: change(info.appleCareID, current.appleCareID))
         guard changes != JamfPurchasing() else {
-            stats.jamfUpToDate += 1
+            if !alreadyCounted { stats.jamfUpToDate += 1 }
             return
         }
 
@@ -217,6 +221,26 @@ final class SyncEngine {
         }
     }
 
+    /// Pushes the purchase data already saved in the output files to Jamf Pro, before contacting ABM.
+    /// Template rows take precedence over preload rows; preload-only devices use Jamf's own device type.
+    private func syncSavedFilesToJamf(computerFile: CSVFile?, mobileFile: CSVFile?, preloadFile: CSVFile) async throws {
+        guard jamf != nil else { return }
+        var saved: [String: (info: PurchaseInfo, isMac: Bool?)] = [:]
+        for (serial, info) in preloadFile.records { saved[serial] = (info, nil) }
+        for (serial, info) in mobileFile?.records ?? [:] { saved[serial] = (info, false) }
+        for (serial, info) in computerFile?.records ?? [:] { saved[serial] = (info, true) }
+        guard !saved.isEmpty else { return }
+
+        statusText = "Updating Jamf Pro from saved files…"
+        append(.info, "Jamf Pro: applying \(saved.count) saved devices from the output files…")
+        for (serial, entry) in saved.sorted(by: { $0.key < $1.key }) {
+            try Task.checkCancellation()
+            try await syncToJamf(entry.info, isMac: entry.isMac ?? jamfDevices[serial]?.isMac ?? false)
+            jamfSynced.insert(serial)
+        }
+        append(.success, "Jamf Pro (saved files) — \(stats.jamfUpdated) updated, \(stats.jamfUpToDate) already up to date, \(stats.jamfNotFound) not in Jamf, \(stats.jamfErrors) errors.")
+    }
+
     // MARK: - Run
 
     private func run(settings: SettingsStore) async {
@@ -226,10 +250,12 @@ final class SyncEngine {
         let started = Date()
         jamf = nil
         jamfDevices = [:]
+        jamfSynced = []
         defer {
             isRunning = false
             jamf = nil
             jamfDevices = [:]
+            jamfSynced = []
             let elapsed = Duration.seconds(Date().timeIntervalSince(started))
             append(.info, "Runtime: \(elapsed.formatted(.time(pattern: .hourMinuteSecond)))")
         }
@@ -281,6 +307,18 @@ final class SyncEngine {
             return fail("Could not prepare output files: \(error.localizedDescription)")
         }
 
+        // Update Jamf from what is already saved locally first; the ABM pass below then only
+        // touches Jamf for devices whose data is new or changed.
+        do {
+            try await syncSavedFilesToJamf(computerFile: wantComputer ? computerFile : nil,
+                                           mobileFile: wantMobile ? mobileFile : nil,
+                                           preloadFile: preloadFile)
+        } catch {
+            statusText = "Cancelled"
+            append(.warning, "Sync cancelled before contacting \(settings.mode == .abm ? "ABM" : "ASM").")
+            return
+        }
+
         // Vendor resolution: local table first, then live API lookup (cached).
         let vendorTable = settings.vendorLookup
         var vendorCache: [String: String] = [:]
@@ -327,7 +365,8 @@ final class SyncEngine {
                     let needsPreload = preloadRecord == nil
                     guard needsTemplate || needsPreload else {
                         stats.skipped += 1
-                        if let existing = templateRecord ?? preloadRecord {
+                        // Already pushed to Jamf from the saved files — nothing new to send.
+                        if !jamfSynced.contains(device.serial), let existing = templateRecord ?? preloadRecord {
                             try await syncToJamf(existing, isMac: isMac)
                         }
                         continue
