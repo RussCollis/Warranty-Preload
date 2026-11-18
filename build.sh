@@ -146,7 +146,11 @@ else
         "ENABLE_HARDENED_RUNTIME=YES"
         "OTHER_CODE_SIGN_FLAGS=--timestamp"
         # Otherwise Xcode adds get-task-allow, which notarization rejects.
+        # Turning injection off also drops the entitlements generated from
+        # ENABLE_APP_SANDBOX etc., so supply them explicitly. Keep this file in
+        # step with the target's sandbox capabilities.
         "CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO"
+        "CODE_SIGN_ENTITLEMENTS=${SCRIPT_DIR}/PurchaseInformationSync.entitlements"
     )
 fi
 
@@ -178,6 +182,8 @@ info "App: $DIST_APP (version ${APP_VERSION} build ${BUILD_NUMBER})"
 codesign --verify --deep --strict "$DIST_APP" || fail "Code signature verification failed."
 if codesign -d --entitlements - --xml "$DIST_APP" 2>/dev/null | grep -q "com.apple.security.app-sandbox"; then
     info "Signature verified (App Sandbox enabled)"
+elif [[ "$SIGN_IDENTITY" != "-" ]]; then
+    fail "App Sandbox entitlement missing from the signed app — check PurchaseInformationSync.entitlements."
 else
     warn "Signature verified, but App Sandbox entitlement not found."
 fi
