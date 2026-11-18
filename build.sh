@@ -3,7 +3,7 @@
 # Purchase Information Sync — build script
 # =============================================================================
 # Builds a Release copy of the app into ./dist and packages it as a .zip
-# (and optionally a .dmg).
+# (and optionally a .dmg and/or an installer .pkg for Jamf / MDM deployment).
 #
 # Signing modes:
 #   (default)          Ad-hoc signed — runs on this Mac / for internal testing.
@@ -15,8 +15,10 @@
 # Usage:
 #   ./build.sh
 #   ./build.sh --dmg
+#   ./build.sh --pkg
 #   ./build.sh --sign "Developer ID Application" --team ABCDE12345 \
-#              --notarize MyNotaryProfile --dmg
+#              --installer-sign "Developer ID Installer" \
+#              --notarize MyNotaryProfile --dmg --pkg
 #
 # Options:
 #   --sign IDENTITY      Code signing identity (default: ad-hoc "-")
@@ -26,6 +28,8 @@
 #   --build-number N     Set the build number (default: git commit count)
 #   --notarize PROFILE   Notarize + staple with the given notarytool profile
 #   --dmg                Also create a .dmg
+#   --pkg                Also create an installer .pkg (installs to /Applications)
+#   --installer-sign ID  Sign the .pkg, e.g. "Developer ID Installer"
 #   --clean              Remove previous build output first
 #   -h, --help           Show this help
 # =============================================================================
@@ -36,6 +40,21 @@ RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; NC=$'\033[0m'
 info()  { echo "${GREEN}-> $*${NC}"; }
 warn()  { echo "${YELLOW}WARN: $*${NC}" >&2; }
 fail()  { echo "${RED}ERROR: $*${NC}" >&2; exit 1; }
+
+# Submit a file for notarization and fail unless Apple accepts it.
+# notarytool exits 0 even when the status is Invalid, so check the status itself.
+notarize() {
+    local file="$1" result sub_id sub_status
+    result="$(xcrun notarytool submit "$file" --keychain-profile "$NOTARY_PROFILE" --wait --output-format json)" \
+        || fail "Notarization submission failed for: $file"
+    sub_id="$(plutil -extract id raw - <<< "$result" 2>/dev/null || true)"
+    sub_status="$(plutil -extract status raw - <<< "$result" 2>/dev/null || true)"
+    info "Notarization ${sub_id}: ${sub_status}"
+    if [[ "$sub_status" != "Accepted" ]]; then
+        [[ -n "$sub_id" ]] && xcrun notarytool log "$sub_id" --keychain-profile "$NOTARY_PROFILE" >&2
+        fail "Notarization was not accepted (status: ${sub_status:-unknown})."
+    fi
+}
 
 # ---------- Paths -------------------------------------------------------------
 SCRIPT_DIR="${0:A:h}"
@@ -54,6 +73,8 @@ VERSION=""
 BUILD_NUMBER=""
 NOTARY_PROFILE=""
 MAKE_DMG=false
+MAKE_PKG=false
+INSTALLER_SIGN=""
 CLEAN=false
 
 while [[ $# -gt 0 ]]; do
@@ -65,8 +86,10 @@ while [[ $# -gt 0 ]]; do
         --build-number) BUILD_NUMBER="$2";  shift 2 ;;
         --notarize)     NOTARY_PROFILE="$2"; shift 2 ;;
         --dmg)          MAKE_DMG=true;      shift ;;
+        --pkg)          MAKE_PKG=true;      shift ;;
+        --installer-sign) INSTALLER_SIGN="$2"; shift 2 ;;
         --clean)        CLEAN=true;         shift ;;
-        -h|--help)      sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)      sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)              fail "Unknown option: $1 (see --help)" ;;
     esac
 done
@@ -80,6 +103,13 @@ if [[ "$SIGN_IDENTITY" != "-" && -z "$TEAM_ID" ]]; then
 fi
 if [[ -n "$NOTARY_PROFILE" && "$SIGN_IDENTITY" == "-" ]]; then
     fail "Notarization requires a Developer ID signature (--sign \"Developer ID Application\" --team …)."
+fi
+
+if [[ -n "$INSTALLER_SIGN" && "$MAKE_PKG" != true ]]; then
+    fail "--installer-sign requires --pkg."
+fi
+if [[ "$MAKE_PKG" == true && -n "$NOTARY_PROFILE" && -z "$INSTALLER_SIGN" ]]; then
+    fail "Notarizing the .pkg requires --installer-sign \"Developer ID Installer\"."
 fi
 
 if [[ -z "$BUILD_NUMBER" ]]; then
@@ -115,6 +145,8 @@ else
         "DEVELOPMENT_TEAM=${TEAM_ID}"
         "ENABLE_HARDENED_RUNTIME=YES"
         "OTHER_CODE_SIGN_FLAGS=--timestamp"
+        # Otherwise Xcode adds get-task-allow, which notarization rejects.
+        "CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO"
     )
 fi
 
@@ -159,8 +191,7 @@ if [[ -n "$NOTARY_PROFILE" ]]; then
     NOTARY_ZIP="${BUILD_DIR}/notarize.zip"
     rm -f "$NOTARY_ZIP"
     ditto -c -k --keepParent "$DIST_APP" "$NOTARY_ZIP"
-    xcrun notarytool submit "$NOTARY_ZIP" --keychain-profile "$NOTARY_PROFILE" --wait \
-        || fail "Notarization failed. Check: xcrun notarytool log <submission-id> --keychain-profile ${NOTARY_PROFILE}"
+    notarize "$NOTARY_ZIP"
     xcrun stapler staple "$DIST_APP" || fail "Stapling failed."
     rm -f "$NOTARY_ZIP"
     info "Notarized and stapled"
@@ -193,14 +224,57 @@ if [[ "$MAKE_DMG" == true ]]; then
         fi
         if [[ -n "$NOTARY_PROFILE" ]]; then
             info "Notarizing DMG…"
-            xcrun notarytool submit "$DMG_PATH" --keychain-profile "$NOTARY_PROFILE" --wait \
-                && xcrun stapler staple "$DMG_PATH" \
-                || fail "DMG notarization failed."
+            notarize "$DMG_PATH"
+            xcrun stapler staple "$DMG_PATH" || fail "DMG stapling failed."
         fi
         info "DMG: $DMG_PATH"
     else
         # Not fatal: the .app and .zip are already built.
         warn "DMG creation failed (disk image service unavailable?). The .app and .zip are still in ${DIST_DIR}."
+    fi
+fi
+
+if [[ "$MAKE_PKG" == true ]]; then
+    BUNDLE_IDENTIFIER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "${DIST_APP}/Contents/Info.plist")"
+    PKG_PATH="${DIST_DIR}/${BASE_NAME}.pkg"
+    PKG_ROOT="${BUILD_DIR}/pkgroot"
+    COMPONENT_PLIST="${BUILD_DIR}/component.plist"
+    COMPONENT_PKG="${BUILD_DIR}/component.pkg"
+    rm -rf "$PKG_ROOT" "$PKG_PATH" "$COMPONENT_PKG" "$COMPONENT_PLIST"
+    mkdir -p "${PKG_ROOT}/Applications"
+    ditto "$DIST_APP" "${PKG_ROOT}/Applications/${APP_NAME}.app"
+
+    # Stop Installer relocating the app to wherever another copy happens to live,
+    # so it always lands in /Applications.
+    pkgbuild --analyze --root "$PKG_ROOT" "$COMPONENT_PLIST" >/dev/null
+    # Newer pkgbuild omits the key, so delete-then-add works either way.
+    /usr/libexec/PlistBuddy -c "Delete :0:BundleIsRelocatable" "$COMPONENT_PLIST" 2>/dev/null || true
+    /usr/libexec/PlistBuddy -c "Add :0:BundleIsRelocatable bool false" "$COMPONENT_PLIST"
+
+    info "Building installer package…"
+    pkgbuild \
+        --root "$PKG_ROOT" \
+        --component-plist "$COMPONENT_PLIST" \
+        --identifier "${BUNDLE_IDENTIFIER}.pkg" \
+        --version "$APP_VERSION" \
+        --install-location "/" \
+        "$COMPONENT_PKG" >/dev/null || fail "pkgbuild failed."
+
+    # Wrap in a distribution (product) archive, which MDM
+    # InstallEnterpriseApplication and notarization require.
+    PRODUCT_ARGS=(--package "$COMPONENT_PKG")
+    [[ -n "$INSTALLER_SIGN" ]] && PRODUCT_ARGS+=(--sign "$INSTALLER_SIGN" --timestamp)
+    productbuild "${PRODUCT_ARGS[@]}" "$PKG_PATH" >/dev/null || fail "productbuild failed."
+    rm -rf "$PKG_ROOT" "$COMPONENT_PKG" "$COMPONENT_PLIST"
+
+    if [[ -n "$NOTARY_PROFILE" ]]; then
+        info "Notarizing package…"
+        notarize "$PKG_PATH"
+        xcrun stapler staple "$PKG_PATH" || fail "Package stapling failed."
+    fi
+    info "PKG: $PKG_PATH"
+    if [[ -z "$INSTALLER_SIGN" ]]; then
+        warn "Package is unsigned. Use --installer-sign \"Developer ID Installer\" for MDM / Gatekeeper."
     fi
 fi
 

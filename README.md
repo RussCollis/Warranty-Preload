@@ -1,5 +1,8 @@
 # Purchase Information Sync
 
+**Version:** 1.0.2
+**Owner:** Russell Collis
+
 [![Buy me a coffee](https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=&slug=russcollis&button_colour=FFDD00&font_colour=000000&font_family=Cookie&outline_colour=000000&coffee_colour=ffffff)](https://www.buymeacoffee.com/russcollis)
 
 If this app saved you time or gave you a foundation to work from, please consider buying me a coffee - cheers :)
@@ -189,3 +192,9 @@ The app is sandboxed. It is allowed outgoing network connections and read/write 
 ## Credits
 
 Based on **Warranty Wrangler**, by Brandon Woods with contributions from the Jamf Nation community (fpatafta, MultiSiggloo) and Russell Collis.
+
+---
+
+## License
+
+MIT © 2026 Russell Collis — see [LICENSE](LICENSE).
